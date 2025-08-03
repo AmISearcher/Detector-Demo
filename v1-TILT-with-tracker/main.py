@@ -143,6 +143,7 @@ def main():
                 detections = run_detection(frame_full)
                 if detections:
                     base.send_command({"T": 132, "IO4": 0, "IO5": 255})
+                    base.send_command({"T": 132, "IO4": 0, "IO5": 0})
                     best_det = max(detections, key=lambda d: d["score"])
                     x1, y1, x2, y2 = map(int, best_det["bbox"])
 
@@ -178,8 +179,6 @@ def main():
                     bbox = (x1_s, y1_s, w_s, h_s)
                     last_detection_time = time.time()
                     last_nodetection_time = last_detection_time
-                else:
-                    base.send_command({"T": 132, "IO4": 0, "IO5": 0})
 
             if tracking and not nodetect_time:
                 success, box = tracker.update(frame_small)
@@ -220,7 +219,6 @@ def main():
                 tilt_angle *= 0.95
                 base.gimbal_ctrl(pan_angle, tilt_angle, 0, 0)
                 csv_writer.writerow([timestamp, -1, -1, 0, 0, 0, pan_angle, tilt_angle, fps])
-                base.send_command({"T": 132, "IO4": 0, "IO5": 0})
 
             if get_laser_distance() is not None:
                 cv2.putText(frame_small, f"Laser: {get_laser_distance():.2f} m", (10, 30),
