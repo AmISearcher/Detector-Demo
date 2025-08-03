@@ -88,6 +88,7 @@ def main():
 
     try:
         while True:
+            base.send_command({"T": 132, "IO4": 0, "IO5": 255})
             base.send_command({"T": 132, "IO4": 0, "IO5": 0})
             start_time = time.time()
             frame = picam2.capture_array()
