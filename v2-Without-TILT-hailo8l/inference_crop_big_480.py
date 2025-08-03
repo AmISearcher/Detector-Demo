@@ -155,6 +155,7 @@ def main():
                 break
 
     finally:
+        base.send_command({"T": 132, "IO4": 0, "IO5": 0})
         picam2.stop()
         cv2.destroyAllWindows()
 
