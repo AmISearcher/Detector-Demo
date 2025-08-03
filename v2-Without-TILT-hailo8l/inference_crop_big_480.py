@@ -74,7 +74,6 @@ def run_detection(frame):
 def main():
     picam2 = Picamera2()
     base = BaseController('/dev/ttyAMA0', 115200)
-    base.send_command({"T": 132, "IO4": 0, "IO5": 255})
     picam2.configure(
         picam2.create_preview_configuration(
             {"format": "RGB888", "size": (2592, 1944)}
@@ -89,6 +88,7 @@ def main():
 
     try:
         while True:
+            base.send_command({"T": 132, "IO4": 0, "IO5": 255})
             start_time = time.time()
             frame = picam2.capture_array()
 
