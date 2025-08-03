@@ -73,6 +73,7 @@ def run_detection(frame):
 
 def main():
     picam2 = Picamera2()
+    base = BaseController('/dev/ttyAMA0', 115200)
     picam2.configure(
         picam2.create_preview_configuration(
             {"format": "RGB888", "size": (2592, 1944)}
