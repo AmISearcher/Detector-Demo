@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import time
 from picamera2 import Picamera2
+from base_ctrl import BaseController
 
 # Parameters
 TILE_WIDTH, TILE_HEIGHT = 480, 480
@@ -98,6 +99,7 @@ def main():
                 last_detection_time = current_time
                 print("detecting: ", detections)
                 if detections:
+                    base.send_command({"T": 132, "IO4": 0, "IO5": 255})
                     best_det = max(detections, key=lambda d: d["score"])
                     x1, y1, x2, y2 = map(int, best_det["bbox"])
                     w, h = x2 - x1, y2 - y1
@@ -120,6 +122,7 @@ def main():
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.putText(frame, "Re-Detected", (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 else:
+                    base.send_command({"T": 132, "IO4": 0, "IO5": 0})
                     print("tracking deactivating")
                     tracking = False  # no new object found
 
