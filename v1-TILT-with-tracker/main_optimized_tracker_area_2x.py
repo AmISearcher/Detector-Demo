@@ -225,7 +225,7 @@ def main():
                 base.send_command({"T": 132, "IO4": 0, "IO5": 0})
 
             if get_laser_distance() is not None:
-                cv2.putText(frame_small, f"Laser: {get_laser_distance():.2f} m",
+                cv2.putText(frame_small, f"Laser: {get_laser_distance():.2f} m", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
             height, width = frame_small.shape[:2]
