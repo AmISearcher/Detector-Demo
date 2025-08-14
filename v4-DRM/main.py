@@ -1,11 +1,12 @@
+#!/usr/bin/env python3
 import degirum as dg
 import cv2
 import numpy as np
 import time
+import sys, termios, tty, select
 from picamera2 import Picamera2, Preview
-#from picamera2.previews import DRMPreview
 
-# ====== Parameters ======
+# ===== Parameters =====
 TILE_WIDTH, TILE_HEIGHT = 480, 480
 OVERLAP_X, OVERLAP_Y = 0.2, 0.2
 STRIDE_X = int(TILE_WIDTH * (1 - OVERLAP_X))
@@ -14,14 +15,20 @@ CONF_THRESHOLD = 0.3
 IOU_THRESHOLD = 0.5
 REDETECT_INTERVAL = 3.0  # seconds
 
-# ====== Load model ======
+# ===== Model load =====
 model = dg.load_model(
     model_name="best",
     inference_host_address="@local",
     zoo_url="../models/model_cropped_big_hailo8",
     token="",
-    overlay_color=(0, 255, 0),
+    overlay_color=(0, 255, 0)
 )
+
+# ===== Helpers =====
+def fb_resolution():
+    with open("/sys/class/graphics/fb0/virtual_size") as f:
+        w, h = f.read().strip().split(",")
+    return int(w), int(h)
 
 def generate_tiles(frame):
     h, w, _ = frame.shape
@@ -37,20 +44,16 @@ def apply_nms(detections, iou_thresh=0.5):
         return []
     boxes = np.array([d["bbox"] for d in detections])
     scores = np.array([d["score"] for d in detections])
+    indices = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), CONF_THRESHOLD, iou_thresh)
+    if isinstance(indices, np.ndarray):
+        indices = indices.flatten().tolist()
+    elif isinstance(indices, list) and indices and isinstance(indices[0], (list, tuple)):
+        indices = [i[0] for i in indices]
+    return [detections[i] for i in indices] if indices else []
 
-    idx = cv2.dnn.NMSBoxes(
-        boxes.tolist(), scores.tolist(), CONF_THRESHOLD, iou_thresh
-    )
-    # Normalize return shapes
-    if isinstance(idx, np.ndarray):
-        idx = idx.flatten().tolist()
-    elif isinstance(idx, list) and idx and isinstance(idx[0], (list, tuple)):
-        idx = [i[0] for i in idx]
-    return [detections[i] for i in idx] if idx else []
-
-def run_detection(frame):
+def run_detection(frame_rgb):
     t0 = time.time()
-    tiles, coords = generate_tiles(frame)
+    tiles, coords = generate_tiles(frame_rgb)
     results = model.predict_batch(tiles)
 
     detections = []
@@ -60,40 +63,43 @@ def run_detection(frame):
                 x1, y1, x2, y2 = det["bbox"]
                 det["bbox"] = [x1 + dx, y1 + dy, x2 + dx, y2 + dy]
                 detections.append(det)
-    print("Detection time:", time.time() - t0)
+    print("Detection time:", f"{time.time()-t0:.3f}s")
     return apply_nms(detections, IOU_THRESHOLD)
 
-def make_overlay(frame_shape, boxes_text, fps_text):
+def make_overlay(h, w, boxes_text, fps_text):
     """
-    Create a BGRA overlay the same size as the preview.
-    boxes_text: list of tuples (pt1, pt2, color_bgr, label)
+    Build BGRA overlay the same size as the DISPLAYED stream (here it's main: 2592x1944).
+    boxes_text: list of (x1,y1,x2,y2,color_bgr,label)
     """
-    h, w = frame_shape[:2]
     overlay = np.zeros((h, w, 4), dtype=np.uint8)  # BGRA
-
-    # Draw boxes and labels
-    for (x1, y1), (x2, y2), color, label in boxes_text:
+    for x1, y1, x2, y2, color, label in boxes_text:
         cv2.rectangle(overlay, (x1, y1), (x2, y2), (*color, 255), 2)
-        cv2.putText(
-            overlay, label, (x1, max(0, y1 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (*color, 255), 2
-        )
-
-    # Draw FPS (bottom-right)
-    cv2.putText(
-        overlay, fps_text, (w - 180, h - 10),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255, 255), 2
-    )
+        cv2.putText(overlay, label, (x1, max(0, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (*color, 255), 2)
+    cv2.putText(overlay, fps_text, (w - 200, h - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255, 255), 2)
     return overlay
 
+def stdin_key_available():
+    return select.select([sys.stdin], [], [], 0)[0]
+
+# ===== Main =====
 def main():
+    # Full-res capture
+    CAP_W, CAP_H = 2592, 1944
+
+    # Fullscreen DRM plane (stretched to fill framebuffer)
+    FB_W, FB_H = fb_resolution()
+
     picam2 = Picamera2()
-    # Use a preview configuration; DRMPreview shows it without X/Wayland
+    # Displayed stream is "main" at full-res; XRGB8888 ensures 32-bit for DRM
     config = picam2.create_preview_configuration(
-        main={"format": "RGB888", "size": (2592, 1944)}
+        main={"format": "XRGB8888", "size": (CAP_W, CAP_H)}
     )
     picam2.configure(config)
-    picam2.start_preview(Preview.DRM)  # <— headless "window"
+
+    # Start DRM preview filling the monitor
+    picam2.start_preview(Preview.DRM, x=0, y=0, width=FB_W, height=FB_H)
     picam2.start()
 
     tracker = None
@@ -101,71 +107,81 @@ def main():
     last_detection_time = 0.0
     fps = 0.0
 
+    # Set terminal to cbreak to read 'q'
+    old_attrs = termios.tcgetattr(sys.stdin)
+    tty.setcbreak(sys.stdin.fileno())
+
     try:
         while True:
             loop_start = time.time()
-            frame = picam2.capture_array()  # RGB888
 
-            boxes_text = []
-            now = time.time()
-            need_redetect = (now - last_detection_time) >= REDETECT_INTERVAL
-            print("tracking:", tracking, "need_redetect:", need_redetect)
+            # Capture XRGB8888 and drop the unused X for OpenCV RGB
+            frame = picam2.capture_array()          # (1944, 2592, 4)
+            frame_rgb = frame[:, :, :3]             # (1944, 2592, 3)
 
+            boxes_for_overlay = []
+
+            need_redetect = (time.time() - last_detection_time) >= REDETECT_INTERVAL
             if not tracking or need_redetect:
-                detections = run_detection(frame)
-                last_detection_time = now
-                print("detections:", detections)
-
+                detections = run_detection(frame_rgb)
+                last_detection_time = time.time()
                 if detections:
-                    best_det = max(detections, key=lambda d: d["score"])
-                    x1, y1, x2, y2 = map(int, best_det["bbox"])
+                    best = max(detections, key=lambda d: d["score"])
+                    x1, y1, x2, y2 = map(int, best["bbox"])
                     w, h = x2 - x1, y2 - y1
-                    print(f"[DEBUG] BBox: ({x1},{y1})-({x2},{y2}) w={w} h={h}")
-
                     if w > 0 and h > 0:
                         try:
                             tracker = cv2.TrackerCSRT_create()
-                            tracker.init(frame, (x1, y1, w, h))
+                            tracker.init(frame_rgb, (x1, y1, w, h))
                             tracking = True
                         except Exception as e:
-                            print(f"[ERROR] tracker.init: {e}")
+                            print("[Tracker init error]", e)
                             tracking = False
                     else:
-                        print("[WARN] Invalid bbox; skip tracker init")
                         tracking = False
-
-                    boxes_text.append(((x1, y1), (x2, y2), (0, 255, 0), "Re-Detected"))
+                    boxes_for_overlay.append((x1, y1, x2, y2, (0, 255, 0), "Re-Detected"))
                 else:
                     tracking = False
 
-            elif tracking:
-                ok, bbox = tracker.update(frame)
+            else:
+                ok, bbox = tracker.update(frame_rgb)
                 if ok:
                     x, y, w, h = map(int, bbox)
-                    boxes_text.append(((x, y), (x + w, y + h), (255, 0, 0), "Tracking"))
+                    boxes_for_overlay.append((x, y, x + w, y + h, (255, 0, 0), "Tracking"))
                 else:
-                    print("tracking lost")
                     tracking = False
 
             # FPS
             inst_fps = 1.0 / max(1e-6, (time.time() - loop_start))
             fps = 0.9 * fps + 0.1 * inst_fps
 
-            # Build and push overlay (BGRA)
-            overlay = make_overlay(frame.shape, boxes_text, f"FPS: {fps:.2f}")
-            # NOTE: set_overlay expects the same size as preview and BGRA order.
+            # Build overlay at DISPLAY stream size (same as main: 2592x1944)
+            overlay = make_overlay(CAP_H, CAP_W, boxes_for_overlay, f"FPS: {fps:.2f}")
             picam2.set_overlay(overlay)
 
-            # No waitKey in headless mode; small sleep to avoid 100% busy loop
+            # Non-blocking quit: press 'q' in this terminal
+            if stdin_key_available():
+                ch = sys.stdin.read(1)
+                if ch.lower() == 'q':
+                    print("Quit requested (q)")
+                    break
+
+            # Tiny sleep to reduce CPU spin
             time.sleep(0.001)
 
     except KeyboardInterrupt:
-        pass
+        print("Interrupted (Ctrl+C).")
     finally:
-        # Clear overlay and stop cleanly
-        picam2.set_overlay(None)
+        # Clear overlay and stop camera/preview
+        try:
+            picam2.set_overlay(None)
+        except Exception:
+            pass
         picam2.stop_preview()
         picam2.stop()
+        # Restore terminal mode
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_attrs)
 
 if __name__ == "__main__":
     main()
+
