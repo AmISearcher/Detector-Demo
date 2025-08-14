@@ -6,7 +6,7 @@ import time
 import sys, termios, tty, select
 from picamera2 import Picamera2, Preview
 
-# --- NEW: norfair imports ---
+# --- Norfair (no extra init args, for older versions too)
 from norfair import Detection, Tracker
 
 # ===== Parameters =====
@@ -16,13 +16,10 @@ STRIDE_X = int(TILE_WIDTH * (1 - OVERLAP_X))
 STRIDE_Y = int(TILE_HEIGHT * (1 - OVERLAP_Y))
 CONF_THRESHOLD = 0.3
 IOU_THRESHOLD = 0.5
-REDETECT_INTERVAL = 3.0  # seconds (set 0.4 if you want more frequent detections)
+REDETECT_INTERVAL = 0.4  # seconds between model runs
 
-# Norfair params (tune as needed)
-DISTANCE_THRESHOLD = 35        # pixels; how close a detection must be to a track
-HITS_TO_START = 1              # detections before a track is "confirmed"
-INITIALIZATION_DELAY = 0
-MAX_AGE = 10                   # frames to keep a track without new detections
+# Norfair tuning (distance works on CENTER POINT movement in pixels)
+DISTANCE_THRESHOLD = 35.0
 
 # ===== Model load =====
 model = dg.load_model(
@@ -30,7 +27,7 @@ model = dg.load_model(
     inference_host_address="@local",
     zoo_url="../models/model_cropped_big_hailo8",
     token="",
-    overlay_color=(0, 255, 0)
+    overlay_color=(0, 255, 0),
 )
 
 # ===== Helpers =====
@@ -90,9 +87,9 @@ def make_overlay(h, w, boxes_text, fps_text):
 def stdin_key_available():
     return select.select([sys.stdin], [], [], 0)[0]
 
-# --- Norfair distance ---
+# ---- Norfair distance function (for older/newer versions)
 def euclidean_distance(detected_points, tracked_points):
-    # each is shape (1,2): [[x,y]]
+    # points are shaped (N,2). We use 1-point tracks so it's (1,2).
     return np.linalg.norm(detected_points - tracked_points)
 
 # ===== Main =====
@@ -105,20 +102,18 @@ def main():
         main={"format": "XRGB8888", "size": (CAP_W, CAP_H)}
     )
     picam2.configure(config)
+    # Fullscreen DRM (stretched)
     picam2.start_preview(Preview.DRM, x=0, y=0, width=FB_W, height=FB_H)
     picam2.start()
 
-    # --- Norfair tracker ---
+    # Norfair tracker with only core args (works on old versions)
     tracker = Tracker(
         distance_function=euclidean_distance,
         distance_threshold=DISTANCE_THRESHOLD,
-        hit_inertia_max=MAX_AGE,
-        initialization_delay=INITIALIZATION_DELAY,
-        points_hit_counter_max=HITS_TO_START,
     )
 
-    # Remember last known box size per track id so we can draw rectangles (Norfair tracks points)
-    track_box_sizes = {}  # track_id -> (w, h)
+    # store last known box (w,h) per track id to draw rectangles
+    track_box_sizes = {}
 
     last_detection_time = 0.0
     fps = 0.0
@@ -133,12 +128,12 @@ def main():
             frame = picam2.capture_array()[:, :, :3]  # RGB
             boxes_for_overlay = []
 
-            # Run detection at intervals; feed results to Norfair
+            # Run detection every REDETECT_INTERVAL and feed results to Norfair
+            nf_dets = None
             if (time.time() - last_detection_time) >= REDETECT_INTERVAL:
                 dets = run_detection(frame)
                 last_detection_time = time.time()
 
-                # Convert to Norfair detections (use center point; keep size in data)
                 nf_dets = []
                 for d in dets:
                     x1, y1, x2, y2 = map(int, d["bbox"])
@@ -153,19 +148,18 @@ def main():
                         )
                     )
 
-                tracks = tracker.update(detections=nf_dets)
+            # Update tracker (with detections when available, else with empty list)
+            tracks = tracker.update(detections=(nf_dets or []))
 
-                # Update size memory from each track's last detection (if available)
-                for t in tracks:
-                    if t.last_detection and "size" in (t.last_detection.data or {}):
-                        track_box_sizes[t.id] = t.last_detection.data["size"]
-            else:
-                # No fresh detections: keep tracker alive (no updates)
-                tracks = tracker.update(detections=[])
-
-            # Draw current tracks as rectangles using last known size
+            # Update remembered sizes from tracks that had detections
             for t in tracks:
-                # t.estimate shape (1,2)
+                if t.last_detection is not None:
+                    data = getattr(t.last_detection, "data", None)
+                    if data and "size" in data:
+                        track_box_sizes[t.id] = data["size"]
+
+            # Draw current tracks using center + last size
+            for t in tracks:
                 cx, cy = t.estimate[0]
                 w, h = track_box_sizes.get(t.id, (100, 100))
                 x1 = int(cx - w / 2)
