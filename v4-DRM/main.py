@@ -2,8 +2,8 @@ import degirum as dg
 import cv2
 import numpy as np
 import time
-from picamera2 import Picamera2
-from picamera2.previews import DRMPreview
+from picamera2 import Picamera2, Preview
+#from picamera2.previews import DRMPreview
 
 # ====== Parameters ======
 TILE_WIDTH, TILE_HEIGHT = 480, 480
@@ -93,7 +93,7 @@ def main():
         main={"format": "RGB888", "size": (2592, 1944)}
     )
     picam2.configure(config)
-    picam2.start_preview(DRMPreview())  # <— headless "window"
+    picam2.start_preview(Preview.DRM)  # <— headless "window"
     picam2.start()
 
     tracker = None
