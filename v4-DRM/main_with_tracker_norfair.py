@@ -5,6 +5,7 @@ import numpy as np
 import time
 import sys, termios, tty, select
 from picamera2 import Picamera2, Preview
+import norfair
 
 # ===== Parameters =====
 TILE_WIDTH, TILE_HEIGHT = 480, 480
@@ -13,7 +14,10 @@ STRIDE_X = int(TILE_WIDTH * (1 - OVERLAP_X))
 STRIDE_Y = int(TILE_HEIGHT * (1 - OVERLAP_Y))
 CONF_THRESHOLD = 0.3
 IOU_THRESHOLD = 0.5
-REDETECT_INTERVAL = 0.4  # seconds
+REDETECT_INTERVAL = 3.0
+TM_METHOD = cv2.TM_CCOEFF_NORMED
+TM_THRESH_LOCKED = 0.35
+DISTANCE_THRESHOLD = 80.0  # in full-res pixels
 
 # ===== Model load =====
 model = dg.load_model(
@@ -44,12 +48,12 @@ def apply_nms(detections, iou_thresh=0.5):
         return []
     boxes = np.array([d["bbox"] for d in detections])
     scores = np.array([d["score"] for d in detections])
-    idx = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), CONF_THRESHOLD, iou_thresh)
-    if isinstance(idx, np.ndarray):
-        idx = idx.flatten().tolist()
-    elif isinstance(idx, list) and idx and isinstance(idx[0], (list, tuple)):
-        idx = [i[0] for i in idx]
-    return [detections[i] for i in idx] if idx else []
+    indices = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), CONF_THRESHOLD, iou_thresh)
+    if isinstance(indices, np.ndarray):
+        indices = indices.flatten().tolist()
+    elif isinstance(indices, list) and indices and isinstance(indices[0], (list, tuple)):
+        indices = [i[0] for i in indices]
+    return [detections[i] for i in indices] if indices else []
 
 def run_detection(frame_rgb):
     t0 = time.time()
@@ -61,91 +65,125 @@ def run_detection(frame_rgb):
         for det in result.results:
             if det["score"] >= CONF_THRESHOLD:
                 x1, y1, x2, y2 = det["bbox"]
-                detections.append({
-                    "bbox": [x1 + dx, y1 + dy, x2 + dx, y2 + dy],
-                    "score": float(det["score"]),
-                })
-    print("Detection time:", f"{time.time()-t0:.3f}s  |  dets:", len(detections))
+                det["bbox"] = [x1 + dx, y1 + dy, x2 + dx, y2 + dy]
+                detections.append(det)
+    print("Detection time:", f"{time.time()-t0:.3f}s")
     return apply_nms(detections, IOU_THRESHOLD)
 
 def make_overlay(h, w, boxes_text, fps_text):
-    """
-    Build **BGRA** overlay (IMPORTANT) matching the DISPLAYED stream size.
-    """
     overlay = np.zeros((h, w, 4), dtype=np.uint8)  # BGRA
-
-    # Always-visible crosshair to prove overlay path works
-    cx, cy = w // 2, h // 2
-    cv2.line(overlay, (cx - 80, cy), (cx + 80, cy), (255, 255, 255, 160), 3)
-    cv2.line(overlay, (cx, cy - 80), (cx, cy + 80), (255, 255, 255, 160), 3)
-
-    # Draw boxes and labels (thicker so scaling doesn't erase them)
     for x1, y1, x2, y2, color, label in boxes_text:
-        # color is BGR; add alpha 255
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (*color, 255), 6)
-        cv2.putText(
-            overlay, label, (x1, max(0, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (*color, 255), 3
-        )
-
-    # FPS box
-    cv2.rectangle(overlay, (w - 240, h - 60), (w - 10, h - 10), (0, 0, 0, 160), -1)
-    cv2.putText(
-        overlay, fps_text, (w - 230, h - 20),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255, 255), 2
-    )
-    return overlay  # BGRA
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (*color, 255), 2)
+        cv2.putText(overlay, label, (x1, max(0, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (*color, 255), 2)
+    cv2.putText(overlay, fps_text, (w - 200, h - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255, 255), 2)
+    return overlay
 
 def stdin_key_available():
     return select.select([sys.stdin], [], [], 0)[0]
 
+def euclidean_distance(detection, tracked_object):
+    return np.linalg.norm(detection.points - tracked_object.estimate)
+
 # ===== Main =====
 def main():
-    CAP_W, CAP_H = 2592, 1944          # full-res capture/display stream
+    CAP_W, CAP_H = 2592, 1944
     FB_W, FB_H = fb_resolution()
 
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(
-        main={"format": "XRGB8888", "size": (CAP_W, CAP_H)}  # 32-bit for DRM
+        main={"format": "XRGB8888", "size": (CAP_W, CAP_H)}
     )
     picam2.configure(config)
-
-    # Fullscreen DRM preview (stretched to FB size)
     picam2.start_preview(Preview.DRM, x=0, y=0, width=FB_W, height=FB_H)
     picam2.start()
 
+    tracker = norfair.Tracker(distance_function=euclidean_distance,
+                               distance_threshold=DISTANCE_THRESHOLD)
+    template = None
+    tpl_w = tpl_h = 0
+
+    tracking = False
     last_detection_time = 0.0
-    last_boxes = []  # carry over boxes between detection cycles
     fps = 0.0
 
-    # Read 'q' without blocking
     old_attrs = termios.tcgetattr(sys.stdin)
     tty.setcbreak(sys.stdin.fileno())
 
     try:
         while True:
             loop_start = time.time()
+            frame = picam2.capture_array()
+            frame_rgb = frame[:, :, :3]
 
-            frame = picam2.capture_array()[:, :, :3]  # RGB (drop the X channel)
+            boxes_for_overlay = []
+            need_redetect = (time.time() - last_detection_time) >= REDETECT_INTERVAL
 
-            # Periodic detection
-            if (time.time() - last_detection_time) >= REDETECT_INTERVAL:
-                dets = run_detection(frame)
+            if not tracking or need_redetect:
+                detections = run_detection(frame_rgb)
                 last_detection_time = time.time()
-                last_boxes = []
-                for d in dets:
-                    x1, y1, x2, y2 = map(int, d["bbox"])
-                    last_boxes.append((x1, y1, x2, y2, (0, 255, 0), "Detected"))
+                if detections:
+                    best = max(detections, key=lambda d: d["score"])
+                    x1, y1, x2, y2 = map(int, best["bbox"])
+                    w, h = x2 - x1, y2 - y1
+                    if w > 0 and h > 0:
+                        template = frame_rgb[y1:y2, x1:x2].copy()
+                        tpl_w, tpl_h = w, h
+                        tracker = norfair.Tracker(
+                            distance_function=euclidean_distance,
+                            distance_threshold=DISTANCE_THRESHOLD
+                        )
+                        det = norfair.Detection(
+                            points=np.array([[x1 + w/2, y1 + h/2]], dtype=np.float32),
+                            scores=np.array([float(best["score"])]),
+                            data={"size": (w, h)}
+                        )
+                        tracker.update([det])
+                        tracking = True
+                    boxes_for_overlay.append((x1, y1, x2, y2, (0, 255, 0), "Re-Detected"))
+                else:
+                    tracking = False
 
-            # FPS calc
+            else:
+                # Template match to get detection
+                res = cv2.matchTemplate(frame_rgb, template, TM_METHOD)
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+                if TM_METHOD in (cv2.TM_SQDIFF, cv2.TM_SQDIFF_NORMED):
+                    score = 1.0 - min_val
+                    tl = min_loc
+                else:
+                    score = max_val
+                    tl = max_loc
+
+                nf_dets = []
+                if score >= TM_THRESH_LOCKED:
+                    cx_d = tl[0] + tpl_w/2
+                    cy_d = tl[1] + tpl_h/2
+                    nf_dets.append(
+                        norfair.Detection(
+                            points=np.array([[cx_d, cy_d]], dtype=np.float32),
+                            scores=np.array([float(score)]),
+                            data={"size": (tpl_w, tpl_h)}
+                        )
+                    )
+                tracks = tracker.update(nf_dets)
+
+                for t in tracks:
+                    est_cx, est_cy = t.estimate[0]
+                    w, h = tpl_w, tpl_h
+                    x1 = int(est_cx - w / 2)
+                    y1 = int(est_cy - h / 2)
+                    x2 = int(est_cx + w / 2)
+                    y2 = int(est_cy + h / 2)
+                    boxes_for_overlay.append((x1, y1, x2, y2, (255, 0, 0), f"Tracking s:{score:.2f}"))
+
             inst_fps = 1.0 / max(1e-6, (time.time() - loop_start))
             fps = 0.9 * fps + 0.1 * inst_fps
 
-            # Build BGRA overlay and PUSH with explicit format
-            overlay = make_overlay(CAP_H, CAP_W, last_boxes, f"FPS: {fps:.2f}")
-            picam2.set_overlay(overlay, format="bgra")  # <-- KEY FIX
+            overlay = make_overlay(CAP_H, CAP_W, boxes_for_overlay, f"FPS: {fps:.2f}")
+            picam2.set_overlay(overlay)
 
-            # Quit on 'q'
             if stdin_key_available():
                 ch = sys.stdin.read(1)
                 if ch.lower() == 'q':
@@ -167,3 +205,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
