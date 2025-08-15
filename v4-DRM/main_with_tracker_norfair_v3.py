@@ -27,9 +27,9 @@ TM_METHOD = cv2.TM_CCOEFF_NORMED
 TM_THRESH = 0.25           # accept template match if score >= this (tune 0.2–0.4)
 
 # Norfair settings (lores pixel space)
-DISTANCE_THRESHOLD = 60.0  # how far a detection can be from track to match (lores px)
+DISTANCE_THRESHOLD = 200.0  # how far a detection can be from track to match (lores px)
 INITIALIZATION_DELAY = 0   # report immediately on first detection (best for sparse dets)
-HIT_COUNTER_MAX = 90       # how many frames a track can live without detections (≈3s @30fps)
+HIT_COUNTER_MAX = 120       # how many frames a track can live without detections (≈3s @30fps)
 
 # ====================== Model ======================
 model = dg.load_model(
