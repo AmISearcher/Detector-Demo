@@ -7,14 +7,16 @@ import degirum as dg
 import norfair
 
 # ====================== Params ======================
-# Tiled detector params
+# Detector (tiled) params
 TILE_WIDTH, TILE_HEIGHT = 480, 480
 OVERLAP_X, OVERLAP_Y = 0.2, 0.2
 STRIDE_X = int(TILE_WIDTH * (1 - OVERLAP_X))
 STRIDE_Y = int(TILE_HEIGHT * (1 - OVERLAP_Y))
 CONF_THRESHOLD = 0.3
-IOU_THRESHOLD = 0.5
-REDETECT_INTERVAL = 0.5   # seconds between model runs
+NMS_IOU = 0.5
+
+# How often to run the heavy detector (seconds)
+REDETECT_INTERVAL = 0.8   # 0.6–1.0 is a good range for smoothness
 
 # Streams: main displayed at full-res; lores for fast matching
 MAIN_W, MAIN_H = 2592, 1944
@@ -22,8 +24,12 @@ LORES_W, LORES_H = 640, 480
 
 # Template-matching for tracker detections (on lores)
 TM_METHOD = cv2.TM_CCOEFF_NORMED
-TM_THRESH = 0.25           # accept template match if score >= this (tune)
-DISTANCE_THRESHOLD = 200.0  # Norfair distance threshold in LORES pixels
+TM_THRESH = 0.25           # accept template match if score >= this (tune 0.2–0.4)
+
+# Norfair settings (lores pixel space)
+DISTANCE_THRESHOLD = 60.0  # how far a detection can be from track to match (lores px)
+INITIALIZATION_DELAY = 0   # report immediately on first detection (best for sparse dets)
+HIT_COUNTER_MAX = 90       # how many frames a track can live without detections (≈3s @30fps)
 
 # ====================== Model ======================
 model = dg.load_model(
@@ -55,9 +61,14 @@ def generate_tiles(frame):
 def apply_nms(detections, iou_thresh=0.5):
     if not detections:
         return []
-    boxes = np.array([d["bbox"] for d in detections])
-    scores = np.array([d["score"] for d in detections])
-    idx = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), CONF_THRESHOLD, iou_thresh)
+    boxes = np.array([d["bbox"] for d in detections], dtype=float)  # [x1,y1,x2,y2]
+    scores = np.array([d["score"] for d in detections], dtype=float)
+    # OpenCV NMS expects [x, y, w, h]
+    xywh = boxes.copy()
+    xywh[:, 2] = boxes[:, 2] - boxes[:, 0]
+    xywh[:, 3] = boxes[:, 3] - boxes[:, 1]
+    idx = cv2.dnn.NMSBoxes(xywh.tolist(), scores.tolist(), CONF_THRESHOLD, iou_thresh)
+    # normalize idx format
     if isinstance(idx, np.ndarray):
         idx = idx.flatten().tolist()
     elif isinstance(idx, list) and idx and isinstance(idx[0], (list, tuple)):
@@ -71,35 +82,35 @@ def run_detection(frame_rgb):
     detections = []
     for result, (dx, dy) in zip(results, coords):
         for det in result.results:
-            if det["score"] >= CONF_THRESHOLD:
+            score = float(det["score"])
+            if score >= CONF_THRESHOLD:
                 x1, y1, x2, y2 = det["bbox"]
                 detections.append({
                     "bbox": [x1 + dx, y1 + dy, x2 + dx, y2 + dy],
-                    "score": float(det["score"]),
+                    "score": score,
                 })
     print(f"[DETECTION] time={time.time()-t0:.3f}s  n={len(detections)}")
-    return apply_nms(detections, IOU_THRESHOLD)
+    return apply_nms(detections, NMS_IOU)
 
 def make_overlay(h, w, boxes_text, fps_text):
     """boxes_text: list of (x1,y1,x2,y2,color_bgr,label) in MAIN coords"""
     ov = np.zeros((h, w, 4), dtype=np.uint8)  # BGRA
-    # crosshair for sanity
+    # crosshair
     cx, cy = w // 2, h // 2
     cv2.line(ov, (cx-120, cy), (cx+120, cy), (255,255,255,180), 3)
     cv2.line(ov, (cx, cy-120), (cx, cy+120), (255,255,255,180), 3)
-
+    # boxes
     for x1, y1, x2, y2, color, label in boxes_text:
         cv2.rectangle(ov, (x1, y1), (x2, y2), (*color, 255), 6)
         cv2.putText(ov, label, (x1, max(0, y1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (*color, 255), 3)
-
     # FPS badge
     cv2.rectangle(ov, (w - 240, h - 60), (w - 12, h - 12), (0, 0, 0, 160), -1)
     cv2.putText(ov, fps_text, (w - 230, h - 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255, 255), 2)
     return ov
 
-# Norfair distance in LORES space
+# Norfair distance function (lores space)
 def nf_distance(detection, tracked_object):
     return np.linalg.norm(detection.points - tracked_object.estimate)
 
@@ -129,11 +140,18 @@ def main():
     # scale lores->main for drawing
     sx, sy = MAIN_W / LORES_W, MAIN_H / LORES_H
 
-    tracker = norfair.Tracker(distance_function=nf_distance,
-                              distance_threshold=DISTANCE_THRESHOLD)
-    track_box_sizes = {}   # track_id -> (w,h) in LORES pixels
+    # Persistent Norfair tracker
+    tracker = norfair.Tracker(
+        distance_function=nf_distance,
+        distance_threshold=DISTANCE_THRESHOLD,
+        initialization_delay=INITIALIZATION_DELAY,
+        hit_counter_max=HIT_COUNTER_MAX,
+    )
 
-    # state for template matching on LORES
+    # Store size per track (in lores pixels) to draw a bbox from center
+    track_box_sizes = {}   # track_id -> (w,h) in LORES
+
+    # Template used between detections (in lores)
     template = None
     tpl_w = tpl_h = 0
 
@@ -147,49 +165,45 @@ def main():
     try:
         while True:
             loop_t = time.time()
-            # Grab both streams
+
+            # Always grab lores for tracking/template
             lo = picam2.capture_array("lores")
             if lo.ndim == 3 and lo.shape[2] == 3:
                 lo_bgr = lo
             else:
                 lo_bgr = cv2.cvtColor(lo, cv2.COLOR_YUV2BGR_I420)
 
-            main_frame = picam2.capture_array()[:, :, :3]  # RGB for detection as needed
+            # Decide if we need to run the heavy detector this frame
+            detections_for_tracker = []
 
-            boxes = []
-            # ---------- Periodic detector on MAIN ---------
-            dets = run_detection(main_frame)
-            last_detection_time = time.time()
+            if (time.time() - last_detection_time) >= REDETECT_INTERVAL:
+                # Grab main frame only when needed (saves bandwidth)
+                main_frame = picam2.capture_array()[:, :, :3]  # RGB
+                dets = run_detection(main_frame)
+                last_detection_time = time.time()
 
-            if dets:
-                best = max(dets, key=lambda d: d["score"])
-                x1m, y1m, x2m, y2m = map(int, best["bbox"])   # MAIN coords
-                wm, hm = x2m - x1m, y2m - y1m
+                if dets:
+                    best = max(dets, key=lambda d: d["score"])
+                    x1m, y1m, x2m, y2m = map(int, best["bbox"])   # MAIN coords
 
-                # Draw detector box (MAIN)
-                boxes.append((x1m, y1m, x2m, y2m, (0, 255, 0), "Re-Detected"))
+                    # Map detection to LORES and crop template (refresh appearance)
+                    x1l = max(0, int(x1m / sx)); y1l = max(0, int(y1m / sy))
+                    x2l = min(LORES_W, int(x2m / sx)); y2l = min(LORES_H, int(y2m / sy))
+                    if x2l > x1l and y2l > y1l:
+                        template = lo_bgr[y1l:y2l, x1l:x2l].copy()
+                        tpl_h, tpl_w = template.shape[:2]
+                        # Create a Norfair Detection at the lores center
+                        det_center = np.array([[(x1l + x2l)/2.0, (y1l + y2l)/2.0]], dtype=np.float32)
+                        detections_for_tracker.append(
+                            norfair.Detection(
+                                points=det_center,
+                                scores=np.array([float(best["score"])], dtype=np.float32),
+                                data={"size": (x2l - x1l, y2l - y1l)},
+                            )
+                        )
+                # else: no detections this cycle; tracker will be updated from template or empty below
 
-                # Map to LORES, cut template
-                x1l = max(0, int(x1m / sx)); y1l = max(0, int(y1m / sy))
-                x2l = min(LORES_W, int(x2m / sx)); y2l = min(LORES_H, int(y2m / sy))
-                if x2l > x1l and y2l > y1l:
-                    template = lo_bgr[y1l:y2l, x1l:x2l].copy()
-                    tpl_h, tpl_w = template.shape[:2]
-                    # init/reset tracker with this detection (in LORES coords)
-                    tracker = norfair.Tracker(distance_function=nf_distance,
-                                              distance_threshold=DISTANCE_THRESHOLD)
-                    init_det = norfair.Detection(
-                        points=np.array([[ (x1l+x2l)/2.0, (y1l+y2l)/2.0 ]], dtype=np.float32),
-                        scores=np.array([float(best["score"])], dtype=np.float32),
-                        data={"size": (x2l - x1l, y2l - y1l)},
-                    )
-                    tracks = tracker.update([init_det])
-                    for t in tracks:
-                        track_box_sizes[t.id] = (x2l - x1l, y2l - y1l)
-
-            # ---------- Between detections: match template on LORES ----------
-            nf_dets = []
-            score = 0.0
+            # Between detector runs: use template match to create detections (if available)
             if template is not None and template.size and tpl_w > 0 and tpl_h > 0:
                 res = cv2.matchTemplate(lo_bgr, template, TM_METHOD)
                 min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
@@ -201,20 +215,24 @@ def main():
                 if score >= TM_THRESH:
                     cx_l = tl[0] + tpl_w / 2.0
                     cy_l = tl[1] + tpl_h / 2.0
-                    nf_dets.append(
+                    detections_for_tracker.append(
                         norfair.Detection(
                             points=np.array([[cx_l, cy_l]], dtype=np.float32),
                             scores=np.array([float(score)], dtype=np.float32),
                             data={"size": (tpl_w, tpl_h)},
                         )
                     )
+                    # Optional: refresh template occasionally to reduce drift
+                    # template = lo_bgr[tl[1]:tl[1]+tpl_h, tl[0]:tl[0]+tpl_w].copy()
 
-            # Update/predict Norfair tracks with (possibly empty) detections
-            tracks = tracker.update(nf_dets)
-            # Draw tracks (convert LORES → MAIN for overlay)
+            # Update/predict Norfair tracks with detections (could be empty)
+            tracks = tracker.update(detections_for_tracker)
+
+            # Draw tracks (convert LORES → MAIN)
+            boxes = []
             for t in tracks:
-                est_cx, est_cy = t.estimate[0]
-                # keep last known size per track (from detections)
+                est_cx, est_cy = t.estimate[0]  # lores center
+                # keep last known size per track (from detections) for bbox drawing
                 if getattr(t, "last_detection", None) and getattr(t.last_detection, "data", None):
                     if "size" in t.last_detection.data:
                         track_box_sizes[t.id] = t.last_detection.data["size"]
@@ -223,9 +241,9 @@ def main():
                 y1m = int((est_cy - h_l/2) * sy)
                 x2m = int((est_cx + w_l/2) * sx)
                 y2m = int((est_cy + h_l/2) * sy)
-                boxes.append((x1m, y1m, x2m, y2m, (255, 0, 0), f"Tracking s:{score:.2f}"))
+                boxes.append((x1m, y1m, x2m, y2m, (255, 0, 0), f"ID {t.id}"))
 
-            # ---------- FPS + overlay ----------
+            # FPS + overlay
             inst_fps = 1.0 / max(1e-6, (time.time() - loop_t))
             fps = 0.9 * fps + 0.1 * inst_fps
             overlay = make_overlay(MAIN_H, MAIN_W, boxes, f"FPS: {fps:.1f}")
@@ -248,4 +266,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
