@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
-import degirum as dg
-import cv2
+import sys, termios, tty, select, time
 import numpy as np
-import time
-import sys, termios, tty, select
+import cv2
 from picamera2 import Picamera2, Preview
+import degirum as dg
 import norfair
 
-# ===== Parameters =====
+# ====================== Params ======================
+# Tiled detector params
 TILE_WIDTH, TILE_HEIGHT = 480, 480
 OVERLAP_X, OVERLAP_Y = 0.2, 0.2
 STRIDE_X = int(TILE_WIDTH * (1 - OVERLAP_X))
 STRIDE_Y = int(TILE_HEIGHT * (1 - OVERLAP_Y))
 CONF_THRESHOLD = 0.3
 IOU_THRESHOLD = 0.5
-REDETECT_INTERVAL = 0.4
+REDETECT_INTERVAL = 0.5   # seconds between model runs
+
+# Streams: main displayed at full-res; lores for fast matching
+MAIN_W, MAIN_H = 2592, 1944
+LORES_W, LORES_H = 640, 480
+
+# Template-matching for tracker detections (on lores)
 TM_METHOD = cv2.TM_CCOEFF_NORMED
-TM_THRESH_LOCKED = 0.35
-DISTANCE_THRESHOLD = 200.0  # Norfair distance (in MAIN pixels)
+TM_THRESH = 0.25           # accept template match if score >= this (tune)
+DISTANCE_THRESHOLD = 200.0  # Norfair distance threshold in LORES pixels
 
-# "Same object" test: if IoU >= this, treat detector hit as same object
-MATCH_IOU = 0.30  # tune 0.25–0.5
-
-# ===== Model load =====
+# ====================== Model ======================
 model = dg.load_model(
     model_name="best",
     inference_host_address="@local",
@@ -31,11 +34,14 @@ model = dg.load_model(
     overlay_color=(0, 255, 0)
 )
 
-# ===== Helpers =====
+# ====================== Helpers ======================
 def fb_resolution():
     with open("/sys/class/graphics/fb0/virtual_size") as f:
         w, h = f.read().strip().split(",")
     return int(w), int(h)
+
+def stdin_key_available():
+    return select.select([sys.stdin], [], [], 0)[0]
 
 def generate_tiles(frame):
     h, w, _ = frame.shape
@@ -51,18 +57,17 @@ def apply_nms(detections, iou_thresh=0.5):
         return []
     boxes = np.array([d["bbox"] for d in detections])
     scores = np.array([d["score"] for d in detections])
-    indices = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), CONF_THRESHOLD, iou_thresh)
-    if isinstance(indices, np.ndarray):
-        indices = indices.flatten().tolist()
-    elif isinstance(indices, list) and indices and isinstance(indices[0], (list, tuple)):
-        indices = [i[0] for i in indices]
-    return [detections[i] for i in indices] if indices else []
+    idx = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), CONF_THRESHOLD, iou_thresh)
+    if isinstance(idx, np.ndarray):
+        idx = idx.flatten().tolist()
+    elif isinstance(idx, list) and idx and isinstance(idx[0], (list, tuple)):
+        idx = [i[0] for i in idx]
+    return [detections[i] for i in idx] if idx else []
 
 def run_detection(frame_rgb):
     t0 = time.time()
     tiles, coords = generate_tiles(frame_rgb)
     results = model.predict_batch(tiles)
-
     detections = []
     for result, (dx, dy) in zip(results, coords):
         for det in result.results:
@@ -72,196 +77,175 @@ def run_detection(frame_rgb):
                     "bbox": [x1 + dx, y1 + dy, x2 + dx, y2 + dy],
                     "score": float(det["score"]),
                 })
-    print("Detection time:", f"{time.time()-t0:.3f}s", "| dets:", len(detections))
+    print(f"[DETECTION] time={time.time()-t0:.3f}s  n={len(detections)}")
     return apply_nms(detections, IOU_THRESHOLD)
 
 def make_overlay(h, w, boxes_text, fps_text):
-    overlay = np.zeros((h, w, 4), dtype=np.uint8)  # BGRA
-    # crosshair
+    """boxes_text: list of (x1,y1,x2,y2,color_bgr,label) in MAIN coords"""
+    ov = np.zeros((h, w, 4), dtype=np.uint8)  # BGRA
+    # crosshair for sanity
     cx, cy = w // 2, h // 2
-    cv2.line(overlay, (cx-120, cy), (cx+120, cy), (255,255,255,180), 3)
-    cv2.line(overlay, (cx, cy-120), (cx, cy+120), (255,255,255,180), 3)
+    cv2.line(ov, (cx-120, cy), (cx+120, cy), (255,255,255,180), 3)
+    cv2.line(ov, (cx, cy-120), (cx, cy+120), (255,255,255,180), 3)
 
     for x1, y1, x2, y2, color, label in boxes_text:
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (*color, 255), 6)
-        cv2.putText(overlay, label, (x1, max(0, y1 - 10)),
+        cv2.rectangle(ov, (x1, y1), (x2, y2), (*color, 255), 6)
+        cv2.putText(ov, label, (x1, max(0, y1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (*color, 255), 3)
+
     # FPS badge
-    cv2.rectangle(overlay, (w - 240, h - 60), (w - 12, h - 12), (0, 0, 0, 160), -1)
-    cv2.putText(overlay, fps_text, (w - 230, h - 20),
+    cv2.rectangle(ov, (w - 240, h - 60), (w - 12, h - 12), (0, 0, 0, 160), -1)
+    cv2.putText(ov, fps_text, (w - 230, h - 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255, 255), 2)
-    return overlay
+    return ov
 
-def stdin_key_available():
-    return select.select([sys.stdin], [], [], 0)[0]
-
-def euclidean_distance(detection, tracked_object):
+# Norfair distance in LORES space
+def nf_distance(detection, tracked_object):
     return np.linalg.norm(detection.points - tracked_object.estimate)
 
-def bbox_from_center(cx, cy, w, h):
-    x1 = int(cx - w/2); y1 = int(cy - h/2)
-    x2 = int(cx + w/2); y2 = int(cy + h/2)
-    return x1, y1, x2, y2
-
-def iou(a, b):
-    # a, b: (x1,y1,x2,y2)
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    inter_x1 = max(ax1, bx1); inter_y1 = max(ay1, by1)
-    inter_x2 = min(ax2, bx2); inter_y2 = min(ay2, by2)
-    iw = max(0, inter_x2 - inter_x1); ih = max(0, inter_y2 - inter_y1)
-    inter = iw * ih
-    area_a = max(0, ax2-ax1) * max(0, ay2-ay1)
-    area_b = max(0, bx2-bx1) * max(0, by2-by1)
-    union = area_a + area_b - inter + 1e-6
-    return inter / union
-
-# ===== Main =====
+# ====================== Main ======================
 def main():
-    CAP_W, CAP_H = 2592, 1944
     FB_W, FB_H = fb_resolution()
+    print(f"[INFO] FB {FB_W}x{FB_H} | main {MAIN_W}x{MAIN_H} | lores {LORES_W}x{LORES_H}")
 
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(
-        main={"format": "XRGB8888", "size": (CAP_W, CAP_H)}
+        main={"format": "XRGB8888", "size": (MAIN_W, MAIN_H)},
+        lores={"format": "YUV420", "size": (LORES_W, LORES_H)},
+        display="main",
     )
     picam2.configure(config)
+
+    # Try to lift FPS (best-effort)
+    try:
+        picam2.set_controls({"FrameDurationLimits": (33333, 33333)})  # ~30fps
+    except Exception:
+        pass
+
     picam2.start_preview(Preview.DRM, x=0, y=0, width=FB_W, height=FB_H)
     picam2.start()
+    print("[INFO] Started. Press 'q' in terminal to quit.")
 
-    tracker = norfair.Tracker(distance_function=euclidean_distance,
-                               distance_threshold=DISTANCE_THRESHOLD)
+    # scale lores->main for drawing
+    sx, sy = MAIN_W / LORES_W, MAIN_H / LORES_H
 
-    # Template + “current track box” state (MAIN coords)
+    tracker = norfair.Tracker(distance_function=nf_distance,
+                              distance_threshold=DISTANCE_THRESHOLD)
+    track_box_sizes = {}   # track_id -> (w,h) in LORES pixels
+
+    # state for template matching on LORES
     template = None
     tpl_w = tpl_h = 0
-    have_track = False
-    track_cx = track_cy = None  # last estimated center (MAIN coords)
 
     last_detection_time = 0.0
     fps = 0.0
 
+    # nonblocking keys
     old_attrs = termios.tcgetattr(sys.stdin)
     tty.setcbreak(sys.stdin.fileno())
 
     try:
         while True:
-            loop_start = time.time()
-            frame = picam2.capture_array()
-            frame_rgb = frame[:, :, :3]
+            loop_t = time.time()
+            # Grab both streams
+            lo = picam2.capture_array("lores")
+            if lo.ndim == 3 and lo.shape[2] == 3:
+                lo_bgr = lo
+            else:
+                lo_bgr = cv2.cvtColor(lo, cv2.COLOR_YUV2BGR_I420)
 
-            boxes_for_overlay = []
-            need_redetect = (time.time() - last_detection_time) >= REDETECT_INTERVAL
+            main_frame = picam2.capture_array()[:, :, :3]  # RGB for detection as needed
 
-            # ========== 1) Periodic detector ==========
-            if need_redetect:
-                dets = run_detection(frame_rgb)
-                last_detection_time = time.time()
+            boxes = []
+            # ---------- Periodic detector on MAIN ---------
+            dets = run_detection(main_frame)
+            last_detection_time = time.time()
 
-                if dets:
-                    best = max(dets, key=lambda d: d["score"])
-                    x1d, y1d, x2d, y2d = map(int, best["bbox"])
-                    wd, hd = x2d - x1d, y2d - y1d
+            if dets:
+                best = max(dets, key=lambda d: d["score"])
+                x1m, y1m, x2m, y2m = map(int, best["bbox"])   # MAIN coords
+                wm, hm = x2m - x1m, y2m - y1m
 
-                    # Compare detector bbox to current track bbox (if we have one)
-                    same_object = False
-                    if have_track and tpl_w > 0 and tpl_h > 0 and track_cx is not None and track_cy is not None:
-                        prev_box = bbox_from_center(track_cx, track_cy, tpl_w, tpl_h)
-                        det_box  = (x1d, y1d, x2d, y2d)
-                        current_iou = iou(prev_box, det_box)
-                        same_object = (current_iou >= MATCH_IOU)
-                        # Debug:
-                        # print(f"[MATCH] IoU={current_iou:.2f} (>= {MATCH_IOU}) -> same={same_object}")
+                # Draw detector box (MAIN)
+                boxes.append((x1m, y1m, x2m, y2m, (0, 255, 0), "Re-Detected"))
 
-                    if wd > 0 and hd > 0:
-                        # Always refresh the template to keep appearance up-to-date
-                        template = frame_rgb[y1d:y2d, x1d:x2d].copy()
-                        tpl_w, tpl_h = wd, hd
+                # Map to LORES, cut template
+                x1l = max(0, int(x1m / sx)); y1l = max(0, int(y1m / sy))
+                x2l = min(LORES_W, int(x2m / sx)); y2l = min(LORES_H, int(y2m / sy))
+                if x2l > x1l and y2l > y1l:
+                    template = lo_bgr[y1l:y2l, x1l:x2l].copy()
+                    tpl_h, tpl_w = template.shape[:2]
+                    # init/reset tracker with this detection (in LORES coords)
+                    tracker = norfair.Tracker(distance_function=nf_distance,
+                                              distance_threshold=DISTANCE_THRESHOLD)
+                    init_det = norfair.Detection(
+                        points=np.array([[ (x1l+x2l)/2.0, (y1l+y2l)/2.0 ]], dtype=np.float32),
+                        scores=np.array([float(best["score"])], dtype=np.float32),
+                        data={"size": (x2l - x1l, y2l - y1l)},
+                    )
+                    tracks = tracker.update([init_det])
+                    for t in tracks:
+                        track_box_sizes[t.id] = (x2l - x1l, y2l - y1l)
 
-                        # Build a Norfair detection from the detector center
-                        det_center = np.array([[x1d + wd/2, y1d + hd/2]], dtype=np.float32)
-                        det_obj = norfair.Detection(points=det_center,
-                                                    scores=np.array([float(best["score"])]),
-                                                    data={"size": (wd, hd)})
-
-                        if same_object and have_track:
-                            # SAME OBJECT: do NOT reset tracker, do NOT draw green box
-                            tracker.update([det_obj])  # reinforce track
-                            # leave drawing to the tracking block below
-                        else:
-                            # NEW OBJECT (or no active track): reset tracker and draw green
-                            tracker = norfair.Tracker(distance_function=euclidean_distance,
-                                                      distance_threshold=DISTANCE_THRESHOLD)
-                            tracker.update([det_obj])
-                            boxes_for_overlay.append((x1d, y1d, x2d, y2d, (0, 255, 0), "Re-Detected"))
-                            have_track = True
-                            # initialize center for next loop
-                            track_cx, track_cy = float(x1d + wd/2), float(y1d + hd/2)
-
-                else:
-                    # No detections: keep tracking via template match + Norfair
-                    pass
-
-            # ========== 2) Between detections: template match to produce detection ==========
+            # ---------- Between detections: match template on LORES ----------
             nf_dets = []
-            track_score = 0.0
+            score = 0.0
             if template is not None and template.size and tpl_w > 0 and tpl_h > 0:
-                res = cv2.matchTemplate(frame_rgb, template, TM_METHOD)
+                res = cv2.matchTemplate(lo_bgr, template, TM_METHOD)
                 min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
                 if TM_METHOD in (cv2.TM_SQDIFF, cv2.TM_SQDIFF_NORMED):
-                    track_score = 1.0 - min_val; tl = min_loc
+                    score = 1.0 - min_val; tl = min_loc
                 else:
-                    track_score = max_val; tl = max_loc
+                    score = max_val; tl = max_loc
 
-                if track_score >= TM_THRESH_LOCKED:
-                    cx_d = tl[0] + tpl_w/2
-                    cy_d = tl[1] + tpl_h/2
+                if score >= TM_THRESH:
+                    cx_l = tl[0] + tpl_w / 2.0
+                    cy_l = tl[1] + tpl_h / 2.0
                     nf_dets.append(
                         norfair.Detection(
-                            points=np.array([[cx_d, cy_d]], dtype=np.float32),
-                            scores=np.array([float(track_score)]),
-                            data={"size": (tpl_w, tpl_h)}
+                            points=np.array([[cx_l, cy_l]], dtype=np.float32),
+                            scores=np.array([float(score)], dtype=np.float32),
+                            data={"size": (tpl_w, tpl_h)},
                         )
                     )
 
-            # Update Norfair with (possibly empty) detections from template match
+            # Update/predict Norfair tracks with (possibly empty) detections
             tracks = tracker.update(nf_dets)
-
-            # Draw tracks (blue) and remember center for “same object” IoU next cycle
+            # Draw tracks (convert LORES → MAIN for overlay)
             for t in tracks:
                 est_cx, est_cy = t.estimate[0]
-                # Size from latest detection if present
+                # keep last known size per track (from detections)
                 if getattr(t, "last_detection", None) and getattr(t.last_detection, "data", None):
                     if "size" in t.last_detection.data:
-                        tpl_w, tpl_h = t.last_detection.data["size"]
-                x1, y1, x2, y2 = bbox_from_center(est_cx, est_cy, tpl_w, tpl_h)
-                boxes_for_overlay.append((x1, y1, x2, y2, (255, 0, 0), f"Tracking s:{track_score:.2f}"))
-                track_cx, track_cy = float(est_cx), float(est_cy)
-                have_track = True
+                        track_box_sizes[t.id] = t.last_detection.data["size"]
+                w_l, h_l = track_box_sizes.get(t.id, (tpl_w or 60, tpl_h or 60))
+                x1m = int((est_cx - w_l/2) * sx)
+                y1m = int((est_cy - h_l/2) * sy)
+                x2m = int((est_cx + w_l/2) * sx)
+                y2m = int((est_cy + h_l/2) * sy)
+                boxes.append((x1m, y1m, x2m, y2m, (255, 0, 0), f"Tracking s:{score:.2f}"))
 
-            # ========== 3) FPS & overlay ==========
-            inst_fps = 1.0 / max(1e-6, (time.time() - loop_start))
+            # ---------- FPS + overlay ----------
+            inst_fps = 1.0 / max(1e-6, (time.time() - loop_t))
             fps = 0.9 * fps + 0.1 * inst_fps
-            overlay = make_overlay(CAP_H, CAP_W, boxes_for_overlay, f"FPS: {fps:.2f}")
+            overlay = make_overlay(MAIN_H, MAIN_W, boxes, f"FPS: {fps:.1f}")
             picam2.set_overlay(overlay)
 
-            # Quit
+            # quit
             if stdin_key_available() and sys.stdin.read(1).lower() == 'q':
-                print("Quit requested (q)")
-                break
+                print("[INFO] Quit requested (q)."); break
 
             time.sleep(0.001)
 
     except KeyboardInterrupt:
-        print("Interrupted (Ctrl+C).")
+        print("\n[INFO] Interrupted.")
     finally:
-        try:
-            picam2.set_overlay(None)
-        except Exception:
-            pass
-        picam2.stop_preview()
-        picam2.stop()
+        try: picam2.set_overlay(None)
+        except Exception: pass
+        picam2.stop_preview(); picam2.stop()
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_attrs)
+        print("[INFO] Clean exit.")
 
 if __name__ == "__main__":
     main()
+
